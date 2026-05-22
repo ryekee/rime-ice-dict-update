@@ -6,7 +6,7 @@
 
 保留你的手动改动 —— 不只是新增的词，连你调过的词频也一并保住。
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![Dependencies: none](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
 
@@ -162,4 +162,4 @@ make test    # 运行测试
 
 ## 📄 许可
 
-[MIT](LICENSE) © Ryekee
+[GPL-3.0-only](LICENSE) © Ryekee —— 与上游 [rime-ice](https://github.com/iDvel/rime-ice) 保持一致。
