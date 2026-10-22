@@ -25,6 +25,13 @@ import subprocess
 import argparse
 import sys
 import datetime
+import json
+import re
+import stat
+from contextlib import contextmanager
+from pathlib import Path
+
+import yaml
 
 Entry = namedtuple("Entry", ["text", "code", "weight"])
 ParsedDict = namedtuple("ParsedDict", ["header", "meta", "entries"])
@@ -33,20 +40,58 @@ ParsedDict = namedtuple("ParsedDict", ["header", "meta", "entries"])
 LOCAL_ENTRIES_MARKER = "# === rimeup 保留的本地词条 ==="
 
 
-class ParseError(Exception):
+class UpdateError(Exception):
     pass
+
+
+class ParseError(UpdateError):
+    pass
+
+
+class MissingBaselineError(UpdateError):
+    pass
+
+
+DEFAULT_COLUMNS = ("text", "code", "weight")
+
+
+class _HeaderLoader(yaml.SafeLoader):
+    """Reject duplicate YAML keys instead of silently discarding settings."""
+
+
+def _unique_mapping(loader, node, deep=False):
+    loader.flatten_mapping(node)
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, str) or key in result:
+            raise ParseError("词典头部存在重复或无效的键")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_HeaderLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _unique_mapping)
+
+
+def _columns(meta):
+    columns = meta.get("columns", list(DEFAULT_COLUMNS))
+    if (not isinstance(columns, list) or not columns
+            or any(c not in DEFAULT_COLUMNS for c in columns)
+            or len(set(columns)) != len(columns) or "text" not in columns):
+        raise ParseError("不支持的 columns：仅支持 text、code、weight，且必须包含 text")
+    return tuple(columns)
 
 
 def entry_key(e):
     return (e.text, e.code)
 
 
-def render_entry(e):
-    if e.weight is not None:
-        return f"{e.text}\t{e.code}\t{e.weight}"
-    if e.code != e.text:
-        return f"{e.text}\t{e.code}"
-    return e.text
+def render_entry(e, columns=DEFAULT_COLUMNS):
+    values = e._asdict()
+    for field in ("code", "weight"):
+        if field not in columns and values[field] is not None:
+            raise ParseError(f"输出 columns 缺少 {field}，不能丢弃已有数据")
+    return "\t".join(values[field] or "" for field in columns).rstrip("\t")
 
 
 def parse_dict(text):
@@ -64,33 +109,41 @@ def parse_dict(text):
 
     header = "\n".join(lines[: term + 1]) + "\n"
 
-    meta = {}
-    for line in lines[: term + 1]:
-        s = line.strip()
-        for field in ("version", "sort", "name"):
-            prefix = field + ":"
-            if s.startswith(prefix):
-                raw = s[len(prefix):].strip()
-                # M6: strip trailing inline comment before stripping quotes
-                comment_idx = raw.find(" #")
-                if comment_idx != -1:
-                    raw = raw[:comment_idx].strip()
-                val = raw.strip('"')
-                meta[field] = val
+    try:
+        meta = yaml.load(header, Loader=_HeaderLoader)
+    except yaml.YAMLError as exc:
+        raise ParseError(f"无效的 YAML 头部：{exc}") from exc
+    if not isinstance(meta, dict):
+        raise ParseError("词典头部必须是 YAML 映射")
+    for field in ("name", "version"):
+        if field not in meta or not isinstance(meta[field], (str, int, float, datetime.date)):
+            raise ParseError(f"词典头部缺少有效的 {field}")
+        meta[field] = str(meta[field])
+        if not meta[field]:
+            raise ParseError(f"词典头部的 {field} 不能为空")
+    columns = _columns(meta)
+    imports = meta.get("import_tables", [])
+    if not isinstance(imports, list) or any(not isinstance(s, str) or not s for s in imports):
+        raise ParseError("import_tables 必须是词典名称列表")
 
     entries = []
     for line in lines[term + 1:]:
         stripped = line.strip()
-        # Rime comments start with '#' — this matches Rime's own comment semantics, so it is correct.
-        if not stripped or stripped.startswith("#"):
+        if stripped == "# no comment":
+            raise ParseError("暂不支持 # no comment 指令，已停止以避免丢失以 # 开头的词条")
+        if not stripped or line.startswith("#"):
             continue
-        # I3: skip document boundary markers that may appear in the entry body
         if stripped in ("...", "---"):
-            continue
+            raise ParseError("词条区存在多余的 YAML 文档标记")
         parts = line.rstrip("\n").split("\t")
-        text_ = parts[0]
-        code = parts[1] if len(parts) > 1 and parts[1] != "" else text_
-        weight = parts[2] if len(parts) > 2 and parts[2] != "" else None
+        if len(parts) > len(columns):
+            raise ParseError("词条列数超过 columns 定义")
+        values = dict(zip(columns, parts))
+        text_ = values.get("text", "")
+        code = values.get("code") or None
+        weight = values.get("weight") or None
+        if not text_.strip() or (weight is not None and not re.fullmatch(r"\d+(?:\.\d+)?%?", weight)):
+            raise ParseError("词条文本为空或词频格式无效")
         entries.append(Entry(text_, code, weight))
     return ParsedDict(header=header, meta=meta, entries=entries)
 
@@ -103,43 +156,51 @@ def compare(local_entries, upstream_entries):
     return n_new, n_local_only
 
 
-def _to_map(entries):
-    return {entry_key(e): e for e in entries}
+def _entry_groups(entries):
+    """Keep duplicate rows and their order; Rime dictionaries can contain them."""
+    result = {}
+    for e in entries:
+        k = entry_key(e)
+        if k not in result:
+            result[k] = e
+        elif isinstance(result[k], Entry):
+            result[k] = (result[k], e)
+        else:
+            result[k] += (e,)
+    return result
 
 
 def merge_incremental(upstream_header, upstream_entries, local_entries, baseline_entries):
-    first_run = baseline_entries is None
-    L = _to_map(local_entries)
-    U = _to_map(upstream_entries)
-    B = _to_map(baseline_entries) if not first_run else {}
+    if baseline_entries is None:
+        raise MissingBaselineError("缺少基线，不能区分旧上游数据与本地改动；请提供历史基线，或明确选择 --overwrite")
+    L = _entry_groups(local_entries)
+    U = _entry_groups(upstream_entries)
+    B = _entry_groups(baseline_entries)
+    columns = _columns(parse_dict(upstream_header).meta)
 
     out_lines = []
+    emitted_local = set()
     for e in upstream_entries:
         k = entry_key(e)
         le = L.get(k)
-        if le is not None and le.weight != e.weight:
-            if first_run:
-                use_local = True
-            else:
-                be = B.get(k)
-                use_local = (be is None) or (be.weight != le.weight)
-            if use_local:
-                out_lines.append(render_entry(le))
-                continue
-        out_lines.append(render_entry(e))
+        if k in B and le is None:
+            continue  # A local deletion is a local change, even if upstream reweighted it.
+        if le is not None and le != U[k] and le != B.get(k):
+            if k not in emitted_local:
+                group = (le,) if isinstance(le, Entry) else le
+                out_lines.extend(render_entry(row, columns) for row in group)
+                emitted_local.add(k)
+            continue
+        out_lines.append(render_entry(e, columns))
 
     appended = []
     for le in local_entries:
         k = entry_key(le)
         if k in U:
             continue
-        if first_run:
-            keep = True
-        else:
-            be = B.get(k)
-            keep = (be is None) or (be != le)
+        keep = L[k] != B.get(k)
         if keep:
-            appended.append(render_entry(le))
+            appended.append(render_entry(le, columns))
 
     text = upstream_header if upstream_header.endswith("\n") else upstream_header + "\n"
     if out_lines:
@@ -148,6 +209,31 @@ def merge_incremental(upstream_header, upstream_entries, local_entries, baseline
         # M9: use the module constant for the marker string
         text += f"\n{LOCAL_ENTRIES_MARKER}\n" + "\n".join(appended) + "\n"
     return text
+
+
+def merge_header(up, local, baseline):
+    """Merge complete metadata. Stop on conflicting structural changes."""
+    if not (up.meta["name"] == local.meta["name"] == baseline.meta["name"]):
+        raise UpdateError("词典 name 不一致，不能合并")
+    missing = object()
+    merged = dict(up.meta)
+    for key in set(local.meta) | set(baseline.meta):
+        if key == "version":
+            continue
+        lv = local.meta.get(key, missing)
+        bv = baseline.meta.get(key, missing)
+        uv = up.meta.get(key, missing)
+        if lv == bv:
+            continue
+        if uv != bv and uv != lv:
+            raise UpdateError(f"词典头部 {key} 在本地和上游同时修改，请先解决冲突")
+        if lv is missing:
+            merged.pop(key, None)
+        else:
+            merged[key] = lv
+    if merged == up.meta:
+        return up.header
+    return "---\n" + yaml.safe_dump(merged, allow_unicode=True, sort_keys=False) + "...\n"
 
 
 def display_width(s):
@@ -271,9 +357,14 @@ def atomic_write(path, text):
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d)
     try:
+        mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        _sync_dir(d)
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -286,6 +377,9 @@ def _copy_rel(rels, src_dir, dst_dir):
         dst = os.path.join(dst_dir, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
+        with open(dst, "rb") as copied:
+            os.fsync(copied.fileno())
+        _sync_dir(os.path.dirname(dst))
 
 
 def backup(rels, rime_dir, backup_dir):
@@ -299,11 +393,24 @@ def update_baseline(rels, upstream_dir, baseline_dir):
 
 
 def _run(cmd):
-    return subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+
+
+def _repo_identity(repo):
+    if repo.startswith("git@github.com:"):
+        repo = "https://github.com/" + repo.split(":", 1)[1]
+    if "://" not in repo:
+        return os.path.realpath(repo)
+    return re.sub(r"\.git$", "", repo.rstrip("/"))
 
 
 def fetch_upstream(repo, cache_dir):
     if os.path.isdir(os.path.join(cache_dir, ".git")):
+        origin = _run(["git", "-C", cache_dir, "remote", "get-url", "origin"]).stdout.strip()
+        if _repo_identity(origin) != _repo_identity(repo):
+            raise UpdateError("缓存仓库来源与 --repo 不一致，请使用独立的 --cache-dir")
+        if _run(["git", "-C", cache_dir, "status", "--porcelain"]).stdout.strip():
+            raise UpdateError("上游缓存存在本地改动，请使用新的 --cache-dir")
         _run(["git", "-C", cache_dir, "fetch", "--depth", "1", "origin", "HEAD"])
         _run(["git", "-C", cache_dir, "reset", "--hard", "FETCH_HEAD"])
     else:
@@ -311,39 +418,239 @@ def fetch_upstream(repo, cache_dir):
         if parent:
             os.makedirs(parent, exist_ok=True)
         _run(["git", "clone", "--depth", "1", repo, cache_dir])
-    out = _run(["git", "-C", cache_dir, "log", "-1", "--format=%h|%ci|%s"]).stdout.strip()
+    out = _run(["git", "-C", cache_dir, "log", "-1", "--format=%H|%ci|%s"]).stdout.strip()
     sha, date, subject = out.split("|", 2)
     return cache_dir, {"sha": sha, "date": date.split()[0], "subject": subject}
 
 
-def apply_overwrite(rels, rime_dir, upstream_dir):
-    for rel in rels:
-        atomic_write(os.path.join(rime_dir, rel), _read(os.path.join(upstream_dir, rel)))
+def _safe_path(root, rel):
+    path = Path(rel)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise UpdateError(f"无效的相对路径：{rel}")
+    target = Path(root)
+    for part in path.parts:
+        target = target / part
+        if target.is_symlink():
+            raise UpdateError(f"不处理符号链接：{target}")
+    return target
 
 
-def apply_incremental(rels, rime_dir, upstream_dir, baseline_dir):
-    """Apply incremental merge for each rel.
+def prepare_update(rels, rime_dir, upstream_dir, baseline_dir, mode):
+    """Build the complete plan in memory. This function never writes files."""
+    writes = {"rime": {}, "baseline": {}}
+    expected = {}
 
-    Returns (first_run_rels, warnings):
-      - first_run_rels: list of rels that had no baseline (first run)
-      - warnings: list of warning strings for files that hit ParseError and were overwritten
-    """
-    first_run_rels = []
-    warnings = []
+    def read(root, rel, track=False):
+        path = _safe_path(root, rel)
+        data = path.read_bytes() if path.exists() else None
+        if track:
+            digest = hashlib.sha256(data).hexdigest() if data is not None else None
+            if str(path) in expected and expected[str(path)] != digest:
+                raise UpdateError(f"文件在检查期间发生变化，已停止：{path}")
+            expected[str(path)] = digest
+        return data.decode("utf-8") if data is not None else None
+
     for rel in rels:
         try:
-            up = parse_dict(_read(os.path.join(upstream_dir, rel)))
-            loc = parse_dict(_read(os.path.join(rime_dir, rel)))
-            base_path = os.path.join(baseline_dir, rel)
-            base_entries = parse_dict(_read(base_path)).entries if os.path.exists(base_path) else None
-            if base_entries is None:
-                first_run_rels.append(rel)
-            merged = merge_incremental(up.header, up.entries, loc.entries, base_entries)
-            atomic_write(os.path.join(rime_dir, rel), merged)
-        except ParseError:
-            atomic_write(os.path.join(rime_dir, rel), _read(os.path.join(upstream_dir, rel)))
-            warnings.append(f"⚠️ {rel}：解析失败，已改为整体覆盖")
-    return first_run_rels, warnings
+            up_text = read(upstream_dir, rel)
+            local_text = read(rime_dir, rel, True)
+            base_text = read(baseline_dir, rel, True)
+            up = parse_dict(up_text)
+            if mode == "overwrite" or local_text is None:
+                merged = up_text
+            else:
+                local = parse_dict(local_text)
+                if _normalize_newlines(local_text) == _normalize_newlines(up_text):
+                    merged = local_text
+                else:
+                    if base_text is None:
+                        raise MissingBaselineError("缺少基线。请提供历史基线，或明确选择 --overwrite；未修改任何词库")
+                    base = parse_dict(base_text)
+                    header = merge_header(up, local, base)
+                    merged = merge_incremental(header, up.entries, local.entries, base.entries)
+            parse_dict(merged)
+            if merged != local_text:
+                writes["rime"][rel] = merged
+            if up_text != base_text:
+                writes["baseline"][rel] = up_text
+        except UpdateError as exc:
+            raise type(exc)(f"{rel}：{exc}") from exc
+
+    # Validate the resulting import graph. Include newly required upstream tables,
+    # but do not install unrelated new dictionaries.
+    visited = set()
+    visiting = set()
+    available = set(find_dict_files(upstream_dir))
+
+    def visit(rel):
+        if rel in visiting:
+            raise UpdateError(f"词典引用存在循环：{rel}")
+        if rel in visited:
+            return
+        visiting.add(rel)
+        content = writes["rime"].get(rel)
+        if content is None:
+            content = read(rime_dir, rel, True)
+        if content is None:
+            if rel not in available:
+                raise UpdateError(f"缺少引用词典：{rel}")
+            content = read(upstream_dir, rel)
+            parsed = parse_dict(content)
+            read(baseline_dir, rel, True)
+            writes["rime"][rel] = content
+            writes["baseline"][rel] = content
+        else:
+            parsed = parse_dict(content)
+        for table in parsed.meta.get("import_tables", []):
+            dependency = table + ".dict.yaml"
+            _safe_path(rime_dir, dependency)
+            if dependency != rel:
+                visit(dependency)
+        visiting.remove(rel)
+        visited.add(rel)
+
+    for rel in rels:
+        visit(rel)
+    return writes, expected
+
+
+JOURNAL = ".rimeup-transaction"
+
+
+def _sync_dir(directory):
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _lock(path):
+    import fcntl
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise UpdateError("另一个 rimeup 正在运行，请稍后再试") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _restore_file(source, target, mode):
+    """Restore exact bytes, including CRLF, without using the update write hook."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as output, open(source, "rb") as original:
+            shutil.copyfileobj(original, output)
+            os.fchmod(output.fileno(), mode)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, target)
+        _sync_dir(str(target.parent))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def recover_transaction(rime_dir, baseline_dir, check_current=True):
+    journal = _safe_path(rime_dir, JOURNAL)
+    if not journal.exists():
+        return False
+    manifest_path = journal / "manifest.json"
+    if not manifest_path.exists():
+        # Preparation never writes destinations until the manifest is durable.
+        shutil.rmtree(journal)
+        return True
+    manifest = json.loads(manifest_path.read_text())
+    roots = {"rime": str(Path(rime_dir).resolve()), "baseline": str(Path(baseline_dir).resolve())}
+    if manifest.get("roots") != roots:
+        raise UpdateError("恢复记录的目录不匹配，请使用原来的 --baseline-dir")
+    if manifest.get("status") not in ("prepared", "committed"):
+        raise UpdateError("恢复记录状态无效，已停止")
+    if manifest.get("status") != "committed":
+        items = manifest["items"]
+        # Validate every recovery source before changing any destination.
+        for item in items:
+            target = _safe_path(roots[item["scope"]], item["rel"])
+            if item["existed"]:
+                source = _safe_path(journal, item["old"])
+                if _sha256(source) != item["sha256"]:
+                    raise UpdateError("恢复副本校验失败；保留恢复记录，请从备份手动恢复")
+            if check_current:
+                current = _sha256(target) if target.exists() else None
+                allowed = (item.get("sha256"), item["new_sha256"])
+                if current not in allowed:
+                    raise UpdateError(f"中断后文件又发生变化，已停止恢复以保留这些改动：{target}")
+        for item in reversed(items):
+            target = _safe_path(roots[item["scope"]], item["rel"])
+            if item["existed"]:
+                _restore_file(journal / item["old"], target, item["mode"])
+            elif target.exists():
+                target.unlink()
+                _sync_dir(str(target.parent))
+    shutil.rmtree(journal)
+    _sync_dir(rime_dir)
+    return True
+
+
+def apply_transaction(writes, expected, rime_dir, baseline_dir, backup_dir):
+    """Back up, stage, and commit dictionaries and baselines as one recoverable batch."""
+    roots = {"rime": str(Path(rime_dir).resolve()), "baseline": str(Path(baseline_dir).resolve())}
+    journal = _safe_path(roots["rime"], JOURNAL)
+    if journal.exists():
+        raise UpdateError("发现未完成的更新，请先运行 rimeup --recover")
+    for path, digest in expected.items():
+        current = _sha256(path) if os.path.exists(path) else None
+        if current != digest:
+            raise UpdateError(f"文件在检查后发生变化，已停止：{path}")
+    backup_path = Path(backup_dir)
+    if backup_path.exists() and any(backup_path.iterdir()):
+        raise UpdateError("备份目录非空，请使用新的 --backup-dir")
+    backup_path.mkdir(parents=True, exist_ok=True)
+    backup([rel for rel in writes["rime"] if _safe_path(rime_dir, rel).exists()], rime_dir, backup_dir)
+    journal.mkdir()
+    manifest = {"roots": roots, "status": "prepared", "items": []}
+    try:
+        for scope, files in writes.items():
+            for rel, content in files.items():
+                target = _safe_path(roots[scope], rel)
+                index = len(manifest["items"])
+                item = {"scope": scope, "rel": rel, "old": f"old-{index}",
+                        "new": f"new-{index}", "existed": target.exists()}
+                if target.exists():
+                    item["mode"] = stat.S_IMODE(target.stat().st_mode)
+                    _restore_file(target, journal / item["old"], item["mode"])
+                    item["sha256"] = _sha256(journal / item["old"])
+                atomic_write(str(journal / item["new"]), content)
+                item["new_sha256"] = _sha256(journal / item["new"])
+                manifest["items"].append(item)
+        # Check again after staging to avoid overwriting edits made during preparation.
+        for path, digest in expected.items():
+            if (_sha256(path) if os.path.exists(path) else None) != digest:
+                raise UpdateError(f"文件在准备期间发生变化，已停止：{path}")
+        atomic_write(str(journal / "manifest.json"), json.dumps(manifest, ensure_ascii=False))
+        _sync_dir(rime_dir)
+        for item in manifest["items"]:
+            target = _safe_path(roots[item["scope"]], item["rel"])
+            atomic_write(str(target), (journal / item["new"]).read_bytes().decode("utf-8"))
+            if _sha256(target) != item["new_sha256"]:
+                raise UpdateError(f"写入后校验失败：{target}")
+        manifest["status"] = "committed"
+        atomic_write(str(journal / "manifest.json"), json.dumps(manifest, ensure_ascii=False))
+    except BaseException:
+        try:
+            recover_transaction(rime_dir, baseline_dir, check_current=False)
+        except Exception as recovery_error:
+            raise UpdateError(f"更新失败，自动回退也失败；已保留 {journal}，请运行 --recover。{recovery_error}") from recovery_error
+        raise
+    # A crash during cleanup leaves a committed journal; recovery only removes it.
+    shutil.rmtree(journal)
+    _sync_dir(rime_dir)
 
 
 UPSTREAM_REPO = "https://github.com/iDvel/rime-ice.git"
@@ -355,52 +662,102 @@ def _default(path):
     return os.path.expanduser(path)
 
 
+def _baseline_default(rime_dir, repo):
+    identity = os.path.realpath(os.path.expanduser(rime_dir)) + "\n" + _repo_identity(repo)
+    key = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    return _default(f"~/Library/Application Support/rimeup/baselines/{key}")
+
+
+def _validate_directories(args):
+    names = ("rime_dir", "cache_dir", "baseline_dir", "backup_dir")
+    for name in names:
+        setattr(args, name, os.path.realpath(os.path.expanduser(getattr(args, name))))
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            pa, pb = getattr(args, a), getattr(args, b)
+            if os.path.commonpath([pa, pb]) in (pa, pb):
+                raise UpdateError(f"{a} 与 {b} 不能相同或互相包含")
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if shutil.which("git") is None:
-        print("错误：未找到 git，请先安装：brew install git", file=sys.stderr)
-        return 1
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     p = argparse.ArgumentParser(prog="rimeup", description="从 rime-ice 上游更新本地 Rime 词库")
     p.add_argument("--rime-dir", default=os.environ.get("RIME_DIR", _default("~/Library/Rime")))
     p.add_argument("--repo", default=UPSTREAM_REPO)
     p.add_argument("--cache-dir", default=_default("~/.cache/rimeup/rime-ice"))
-    p.add_argument("--baseline-dir", default=_default("~/.cache/rimeup/baseline"))
+    p.add_argument("--baseline-dir", help="历史上游基线目录；默认按 Rime 目录和上游仓库独立保存")
     p.add_argument("--backup-dir",
                    default=_default(f"~/Library/Application Support/rimeup/backups/{ts}"))
-    p.add_argument("--check", "-n", action="store_true", help="只展示表格，不改动")
+    p.add_argument("--check", "-n", action="store_true", help="拉取并检查，不修改词库、基线或备份")
+    p.add_argument("--recover", action="store_true", help="恢复中断的更新，不拉取或更新词库")
     # M7: --overwrite and --incremental are mutually exclusive
     mode_group = p.add_mutually_exclusive_group()
     mode_group.add_argument("--overwrite", action="store_true", help="整体覆盖更新")
     mode_group.add_argument("--incremental", action="store_true", help="词条级增量合并")
     args = p.parse_args(argv)
+    args.baseline_dir = args.baseline_dir or _baseline_default(args.rime_dir, args.repo)
+    if args.recover and (args.check or args.overwrite or args.incremental):
+        p.error("--recover 不能与检查或更新选项同时使用")
+    if not args.recover and shutil.which("git") is None:
+        print("错误：未找到 git，请先安装：brew install git", file=sys.stderr)
+        return 1
 
     if not os.path.isdir(args.rime_dir):
         print(f"错误：Rime 目录不存在：{args.rime_dir}", file=sys.stderr)
         return 2
 
     try:
+        _validate_directories(args)
+        if args.recover:
+            with _lock(os.path.join(args.rime_dir, ".rimeup.lock")):
+                restored = recover_transaction(args.rime_dir, args.baseline_dir)
+            print("已恢复中断的更新。" if restored else "没有需要恢复的更新。")
+            return 0
+        if os.path.lexists(os.path.join(args.rime_dir, JOURNAL)):
+            raise UpdateError("发现未完成的更新；请先使用相同目录参数运行 rimeup --recover")
+        with _lock(args.cache_dir + ".lock"):
+            if args.check:
+                return _execute(args)
+            with _lock(os.path.join(args.rime_dir, ".rimeup.lock")):
+                return _execute(args)
+    except (UpdateError, OSError, UnicodeError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print("已取消。", file=sys.stderr)
+        return 130
+
+
+def _execute(args):
+    identity = {"rime_dir": args.rime_dir, "repo": _repo_identity(args.repo)}
+    identity_path = _safe_path(args.baseline_dir, ".rimeup-source.json")
+    identity_text = identity_path.read_text() if identity_path.exists() else None
+    if identity_text is not None and json.loads(identity_text) != identity:
+        raise UpdateError("基线属于其他 Rime 目录或上游仓库，请使用独立的 --baseline-dir")
+    stale = False
+    try:
         cache, head = fetch_upstream(args.repo, args.cache_dir)
-    except Exception as e:  # noqa: BLE001
-        if os.path.isdir(os.path.join(args.cache_dir, ".git")):
-            print(f"警告：拉取上游失败，改用旧缓存：{e}", file=sys.stderr)
-            cache = args.cache_dir
-            head = {"sha": "?", "date": "?", "subject": "(stale cache)"}
-        else:
-            print(f"错误：无法获取上游：{e}", file=sys.stderr)
-            return 1
+    except (OSError, subprocess.SubprocessError) as exc:
+        if not args.check or not os.path.isdir(os.path.join(args.cache_dir, ".git")):
+            raise UpdateError(f"无法获取上游，已停止：{exc}") from exc
+        print(f"警告：拉取失败，以下仅为旧缓存比较，不能证明已是最新：{exc}", file=sys.stderr)
+        cache, head = args.cache_dir, {"sha": "?", "date": "?", "subject": "旧缓存，仅供检查"}
+        stale = True
 
     discovered = discover_dicts(args.rime_dir, cache)
     rows = []
+    invalid = False
     for d in discovered:
         if d["status"] == "updated":
             try:
                 lv, uv, n_new, n_local = dict_stats(d["local_path"], d["up_path"])
                 status_label = STATUS_LABEL[d["status"]]
-            except ParseError:
+            except (ParseError, UnicodeError):
                 lv = uv = "?"
                 n_new = n_local = None
                 status_label = "有更新(解析失败)"
+                invalid = True
         elif d["status"] == "upstream_new":
             # C2: use _safe_version so a malformed file returns '?' instead of crashing
             lv, uv, n_new, n_local = "—", _safe_version(d["up_path"]), None, None
@@ -419,14 +776,18 @@ def main(argv=None):
     print(render_table(rows, head))
 
     updated = [d["name"] for d in discovered if d["status"] == "updated"]
-    if not updated:
-        print("没有需要更新的词库。")
-        return 0
-
     if args.check:
-        return 0
+        if not stale and (args.incremental or args.overwrite):
+            common = [d["name"] for d in discovered if d["status"] in ("same", "updated")]
+            plan, _ = prepare_update(common, args.rime_dir, cache, args.baseline_dir,
+                                     "overwrite" if args.overwrite else "incremental")
+            print(f"预检通过：计划修改 {len(plan['rime'])} 个词库；未写入。")
+            return 0
+        return 1 if stale or invalid else 0
 
     mode = "overwrite" if args.overwrite else "incremental" if args.incremental else None
+    if mode is None and not updated:
+        mode = "incremental"  # Identical files can safely seed their upstream baseline.
     if mode is None:
         print("\n[1] 覆盖更新   [2] 增量合并   [3] 不更新")
         choice = input("请选择 [1/2/3]: ").strip()
@@ -435,20 +796,23 @@ def main(argv=None):
         print("未做任何更改。")
         return 0
 
-    backup(updated, args.rime_dir, args.backup_dir)
-    if mode == "overwrite":
-        apply_overwrite(updated, args.rime_dir, cache)
-    else:
-        first_run_rels, parse_warnings = apply_incremental(updated, args.rime_dir, cache, args.baseline_dir)
-        for w in parse_warnings:
-            print(w)
-        if first_run_rels:
-            print("⚠️ 首次增量无基线，已保留全部本地差异；下次起将精确区分。")
-    update_baseline(updated, cache, args.baseline_dir)
+    common = [d["name"] for d in discovered if d["status"] in ("same", "updated")]
+    if not common:
+        print("没有与上游对应的本地词库，未更新。")
+        return 0
+    writes, expected = prepare_update(common, args.rime_dir, cache, args.baseline_dir, mode)
+    if identity_text is None:
+        writes["baseline"][".rimeup-source.json"] = json.dumps(identity, ensure_ascii=False)
+        expected[str(identity_path)] = None
+    if not any(writes.values()):
+        print("没有需要写入的词库或基线。")
+        return 0
+    apply_transaction(writes, expected, args.rime_dir, args.baseline_dir, args.backup_dir)
 
-    print(f"\n已{'覆盖' if mode == 'overwrite' else '增量合并'}更新 {len(updated)} 个词库。")
+    print(f"\n已{'覆盖' if mode == 'overwrite' else '增量合并'}更新 {len(writes['rime'])} 个词库；基线已保存。")
     print(f"备份：{args.backup_dir}")
-    print("⚠️ 请在输入法菜单点「重新部署」让改动生效。")
+    if writes["rime"]:
+        print("请在输入法菜单点「重新部署」让改动生效。")
     return 0
 
 

@@ -1,165 +1,156 @@
-<div align="center">
-
 # rimeup
 
-**一行命令，把 [雾凇拼音 / rime-ice](https://github.com/iDvel/rime-ice) 上游词库安全地更新到你本地。**
+从 [iDvel/rime-ice](https://github.com/iDvel/rime-ice) 更新 Rime 的 `.dict.yaml` 词库。项目仓库是 [ryekee/rime-ice-dict-update](https://github.com/ryekee/rime-ice-dict-update)。
 
-保留你的手动改动 —— 不只是新增的词，连你调过的词频也一并保住。
+支持覆盖更新和三方增量合并。每次更新先检查全部文件，再备份、写入并校验。失败时回退词库和基线。工具不会重新部署输入法。
 
-[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-[![Dependencies: none](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
+需要 Python 3.8+、Git 和 PyYAML 6.x。当前支持 macOS 和 Linux；并发锁使用 POSIX `flock`。
 
-</div>
+## 安装
 
----
-
-## 痛点
-
-[rime-ice](https://github.com/iDvel/rime-ice) 的词库一直在更新，但它**不是**通过包管理器分发的——你得手动去仓库里下载词库文件覆盖到本地。于是每次更新都要：翻仓库、比版本、决定覆盖还是合并、手动备份、再重新部署。更麻烦的是，一旦你在词库里加过自定义词、调过某些词的词频，**直接覆盖就全没了**。
-
-`rimeup` 把这一整套变成一条命令。
-
-## ✨ 特性
-
-- 🔍 **一眼看清差异** —— 表格列出每个词库的本地/上游版本、状态，以及「上游新增 / 本地独有」的词条数。
-- 🔀 **三方增量合并** —— 拉取上游更新的同时，**保留你的本地新增词条和词频调整**（靠基线区分「你改的」与「上游改的」，详见下文）。
-- 💥 **也支持整体覆盖** —— 想要干净的上游版本？一个选项搞定。
-- 🛡️ **安全第一** —— 改动前自动备份；原子写入，中途崩溃也不会写坏词库；只动 `*.dict.yaml`，绝不碰你的 schema / lua / opencc；本地独有的词库文件只跳过、不删除。
-- 🪶 **零运行时依赖** —— 单个 Python 文件，只用标准库（另需系统自带的 `git`）。
-
-## 📸 长这样
-
-```text
-$ rimeup
-
-上游 HEAD: a5d123b  2026-05-18  dict: 增改词汇 (#1545)
-
-词库                        本地版本    上游版本    状态      上游新增  本地独有
-cn_dicts/base.dict.yaml     2025-11-01  2026-05-16  有更新     +7177      12
-cn_dicts/ext.dict.yaml      2025-11-01  2026-05-16  有更新     +1562       0
-en_dicts/en_ext.dict.yaml   2025-10-31  2026-03-08  有更新     +286        4
-liangfen.dict.yaml          5.0         —           本地独有   -          -
-melt_eng.dict.yaml          2023-05-09  2023-05-09  相同       -          -
-共 5 个词库：3 个有更新，1 个相同，1 个本地独有，0 个上游新文件。
-
-[1] 覆盖更新   [2] 增量合并   [3] 不更新
-请选择 [1/2/3]:
-```
-
-## 📦 安装
-
-> 适用于 macOS（默认 Rime 目录 `~/Library/Rime`，对应 Squirrel／鼠须管）。其他平台见[配置](#️-选项与配置)。
-
-**方式一：pipx（推荐）**
+推荐用 pipx 隔离依赖：
 
 ```bash
 pipx install git+https://github.com/ryekee/rime-ice-dict-update.git
 ```
 
-**方式二：pip**
+从本地源码安装：
 
 ```bash
-pip install git+https://github.com/ryekee/rime-ice-dict-update.git
+pipx install .
+# 更新已有安装：
+pipx install --force .
 ```
 
-**方式三：单文件，零安装**
-
-工具就是一个自包含的脚本，下载下来丢进 `PATH` 即可：
+也可以使用独立的 Python 虚拟环境：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ryekee/rime-ice-dict-update/main/rimeup.py \
-  -o ~/.local/bin/rimeup && chmod +x ~/.local/bin/rimeup
+python3 -m venv .venv
+.venv/bin/python -m pip install .
+.venv/bin/rimeup --help
 ```
 
-**方式四：从源码**
+1.1 起使用 PyYAML 解析词典头部。旧版的单文件 `curl` 安装方式不再适用。不要把脚本复制到缺少 PyYAML 的 Python 环境中。
+
+## 检查与更新
 
 ```bash
-git clone https://github.com/ryekee/rime-ice-dict-update.git
-cd rime-ice-dict-update
-make install        # = pipx install .
+rimeup --check                # 拉取上游并列出差异，不写词库、基线或备份
+rimeup --incremental --check  # 额外预检增量合并、基线和词典引用，仍不写入
+rimeup                       # 显示差异，再选择覆盖、增量合并或退出
+rimeup --incremental         # 基于历史上游基线合并
+rimeup --overwrite           # 明确用上游内容替换对应词库，本地改动会被覆盖
 ```
 
-装好后确认一下：
+检查命令会更新 Git 下载缓存。它不会修改 Rime 目录。拉取失败时，普通 `--check` 可以显示旧缓存的比较结果，但会标明缓存过期并返回非零退出码。更新命令在拉取失败时停止，不使用旧缓存写入。
 
-```bash
-rimeup --check
-```
+差异表比较本地和上游内容。本地定制也会使文件显示「有更新」，不代表上游一定有新提交。实际写入计划会排除合并后没有变化的文件。
 
-## 🚀 使用
+成功更新词库后，请在输入法菜单中手动选择「重新部署」。词库写入成功不代表 Rime 已完成编译。
 
-```bash
-rimeup                # 比对差异，交互选择：覆盖 / 增量合并 / 不更新
-rimeup --check        # 只看差异表格，不做任何改动（-n 等价）
-rimeup --incremental  # 直接增量合并（保留本地新增 + 词频调整）
-rimeup --overwrite    # 直接整体覆盖为上游版本
-```
+## 增量合并规则
 
-更新完成后，**记得在输入法菜单点「重新部署」**让改动生效（大词库首次编译会花一点时间，属正常）。
-
-## 🔀 增量合并是怎么工作的
-
-「直接覆盖」会丢掉你的手动改动；而「只要本地和上游不一样就保留本地」又会让你**永远拿不到上游对那些词的更新**——因为分不清到底是「你改的」还是「上游改的」。
-
-`rimeup` 用一份**基线**（你上次同步时的上游版本，存于 `~/.cache/rimeup/baseline/`）做三方合并，对每个 `(词, 编码)`：
+基线是上次成功同步的**原始上游词库**，不是合并后的本地文件。
 
 | 情况 | 处理 |
 | --- | --- |
-| 本地新增的词（基线、上游都没有） | ✅ **保留你的** |
-| 本地 == 基线（你没动过） | ⬆️ **跟随上游**（拿到上游的新词 / 调频；上游若删除则随之删除） |
-| 本地 != 基线（你改过词频 / 内容） | ✅ **保留你的** |
-| 上游新增的词 | ⬆️ **并入** |
+| 本地词条与基线相同 | 采用上游修改，包括调频和删除 |
+| 本地新增词条 | 保留 |
+| 本地修改词频 | 保留本地词频 |
+| 本地删除词条或修改编码 | 保留删除；修改编码视为删除旧词条、添加新词条 |
+| 上游新增词条 | 加入 |
+| 本地修改词典头部 | 按字段合并，包括 `import_tables`；同一字段双方改动且结果不同时停止 |
+| 缺少基线，且本地与上游不同 | **整次停止，不猜测哪些差异是本地定制** |
+| 缺少基线，但本地与上游完全一致 | 可以直接建立基线 |
 
-> **首次增量**：还没有基线时，会保守地保留所有「本地与上游不同」的词条，并给出提示；从第二次起就能精确区分了。
->
-> 本地独有的新增词条会被追加到文件末尾、带 `# === rimeup 保留的本地词条 ===` 标记；rime-ice 词库多为 `sort: by_weight`，Rime 部署时会自动重排。
+解析器按 `columns` 定义处理字段，支持 `text`、`code`、`weight` 及其排列。腾讯词库的 `text, weight` 两列格式可正常合并。自动注音词条的空编码与显式编码分别处理。
 
-## 🛡️ 安全保障
+同一词条的重复记录按有序的一组数据合并。未修改的重复记录保留上游顺序，不用最后一条覆盖前面的记录。
 
-- **自动备份**：任何改动前，会把将被修改的文件备份到 `~/Library/Application Support/rimeup/backups/<时间戳>/`。
-- **原子写入**：先写临时文件再替换，进程中途中断也不会留下半截损坏的词库。
-- **范围受限**：只处理 `*.dict.yaml`（仓库根目录 + `cn_dicts/` + `en_dicts/`），不动 schema、lua、opencc 等其它文件。
-- **不误删**：上游已移除、但你本地还留着的词库（如 `liangfen.dict.yaml`）会被标为「本地独有」并跳过，绝不删除。
-- **解析容错**：个别词库若解析失败，会自动降级为「整体覆盖」并提示，绝不让一个坏文件中断整次更新。
+不支持的列、`# no comment` 指令、无效 YAML 或无效词频会使更新停止。增量模式不会因解析失败而自动改成覆盖模式。显式 `--overwrite` 可以替换损坏的本地文件，但上游文件仍必须通过验证。
 
-## ⚙️ 选项与配置
+头部无需修改时保留上游原文。需要合并头部字段时重新生成 YAML，语义设置保留，原头部注释和排版可能改变。词条区的说明注释不参与三方合并。
 
-| 选项 | 说明 | 默认 |
-| --- | --- | --- |
-| `--check`, `-n` | 只展示差异表格，不改动 | |
-| `--overwrite` | 整体覆盖更新（与 `--incremental` 互斥） | |
-| `--incremental` | 词条级增量合并（与 `--overwrite` 互斥） | |
-| `--rime-dir DIR` | 本地 Rime 配置目录 | `~/Library/Rime`（或环境变量 `RIME_DIR`） |
-| `--repo URL` | 上游仓库 | `https://github.com/iDvel/rime-ice.git` |
-| `--cache-dir DIR` | 上游缓存克隆目录 | `~/.cache/rimeup/rime-ice` |
-| `--baseline-dir DIR` | 三方合并的基线目录 | `~/.cache/rimeup/baseline` |
-| `--backup-dir DIR` | 备份目录 | `~/Library/Application Support/rimeup/backups/<时间戳>` |
+### 从 1.0 迁移
 
-非 macOS 用户：用 `--rime-dir` 或环境变量 `RIME_DIR` 指向你的 Rime 目录（例如 fcitx5 的 `~/.local/share/fcitx5/rime`）即可。
+默认基线从可清理的缓存目录移至：
 
-## 🧑‍💻 开发
-
-```bash
-git clone https://github.com/ryekee/rime-ice-dict-update.git
-cd rime-ice-dict-update
-make dev     # 建 venv 并安装 pytest
-make test    # 运行测试
+```text
+~/Library/Application Support/rimeup/baselines/<Rime目录与上游仓库的标识>/
 ```
 
-工具本身仅依赖 Python 标准库；测试用 `pytest`，且全部离线运行（用本地临时 git 仓库充当「上游」，不联网）。
+不同 Rime 目录或不同上游使用独立基线。首次成功写入会记录基线所属目录和仓库，避免混用。
 
-## ❓ 常见问题
+旧基线**不会自动迁移或假定可信**。确认旧基线来自当前目录和上游后，可以显式使用它：
 
-**改完没生效？** 需要在输入法菜单（菜单栏图标）点「重新部署」重新编译词库。
+```bash
+rimeup --baseline-dir ~/.cache/rimeup/baseline --incremental --check
+```
 
-**所有词库都显示「相同」？** 说明本地已经是最新；下次上游更新后再跑就会看到 `有更新`。
+旧版仅给实际修改过的文件保存基线，因此旧基线可能不完整。缺少基线时，应提供对应的历史上游文件；如果明确要舍弃本地差异，也可以选择 `--overwrite` 建立新基线。工具不会把当前本地文件直接当成历史上游。
 
-**上游新增了一个全新词库文件？** 当前版本只在表格里报告（`上游新文件`），不会自动加入——因为新词库需要你在 schema 里引用后才有意义。
+## 更新范围
 
-## 🙏 致谢
+扫描仓库根目录、`cn_dicts/` 和 `en_dicts/` 内的 `.dict.yaml` 文件。
 
-词库来自 [**iDvel/rime-ice（雾凇拼音）**](https://github.com/iDvel/rime-ice)。`rimeup` 只是一个更新工具，所有词库数据归原项目所有，请遵循其许可协议。
+- 更新本地与上游都有的词库。本地独有文件不删除。
+- 上游新词库通常只报告。当它被合并结果的 `import_tables` 引用时，连同该依赖一起安装、备份记录和回退。
+- 缺少引用词库、引用越界或循环引用时，整次停止。
+- 不更新 schema、Lua、OpenCC、自定义短语 `.txt` 或用户学习库 `.userdb`。
+- 这不是完整的雾凇配置更新器；中英混输 `.txt` 文件也不在更新范围内。
 
-## 📄 许可
+## 失败恢复
 
-[GPL-3.0-only](LICENSE) © Ryekee —— 与上游 [rime-ice](https://github.com/iDvel/rime-ice) 保持一致。
+更新流程：
+
+1. 在内存中准备全部结果，验证词典格式与引用关系。
+2. 检查文件是否在准备期间被其他程序改动。备份即将替换的本地词库。
+3. 保存词库、基线的原始字节和权限，以及待写入文件和恢复记录。
+4. 逐文件原子替换，并在写后校验 SHA-256。词库与基线属于同一批更新。
+5. 全部写入成功后标记完成，再清理恢复记录。
+
+捕获到写入错误或键盘中断时，自动恢复整批词库和基线，并删除本次新增的词库文件。自动回退失败时保留恢复副本并报错。
+
+**整批更新不是一个文件系统原子操作。** 强制结束进程、断电等情况可能暂时留下部分更新。下次运行会检测到恢复记录并停止，避免继续更新。此时使用原来的目录参数恢复：
+
+```bash
+rimeup --recover
+# 使用过自定义目录时：
+rimeup --rime-dir /path/to/rime --baseline-dir /path/to/baseline --recover
+```
+
+恢复操作不联网。如果中断发生在全部写入完成并已记录成功之后，恢复命令只清理记录。恢复完成前不要手动重新部署。恢复依赖磁盘上的副本，不能替代独立备份，也不保证损坏磁盘上的数据可恢复。
+
+备份默认位于 `~/Library/Application Support/rimeup/backups/<时间戳>/`。不允许覆盖非空备份目录。正常完成后的该备份包含被替换的本地词库；恢复中断更新所需的基线副本保存在 Rime 目录的 `.rimeup-transaction/`，成功或回退完成后清理。
+
+## 选项
+
+| 选项 | 说明 |
+| --- | --- |
+| `--check`, `-n` | 只检查；可与一种更新模式组合进行预检 |
+| `--incremental` | 三方增量合并 |
+| `--overwrite` | 整体覆盖，与增量模式互斥 |
+| `--recover` | 恢复中断更新，与检查、更新模式互斥 |
+| `--rime-dir DIR` | 默认为 `~/Library/Rime`，或环境变量 `RIME_DIR` |
+| `--repo URL` | 默认为 `https://github.com/iDvel/rime-ice.git` |
+| `--cache-dir DIR` | 默认为 `~/.cache/rimeup/rime-ice` |
+| `--baseline-dir DIR` | 默认按本地目录和上游仓库独立保存 |
+| `--backup-dir DIR` | 使用新的备份目录；已有目录必须为空 |
+
+Rime、缓存、基线、备份目录不能相同或互相包含。工具拒绝修改符号链接词库，拒绝重置有本地改动的 Git 缓存，并校验缓存的 `origin`。
+
+退出码：`0` 表示操作成功，`1` 表示检查或更新失败，`2` 表示参数错误或 Rime 目录不存在，`130` 表示用户取消。POSIX 文件锁阻止同一目录或缓存的并发更新。
+
+## 开发与测试
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pytest -q
+```
+
+测试使用临时目录和本地 Git 仓库，不访问用户的 Rime 数据。覆盖两列及重排列词库、基线缺失、本地删除和头部修改、引用依赖、写入失败、进程强制退出后恢复、缓存失败及 CLI 退出码。
+
+## 许可
+
+[GPL-3.0-only](LICENSE) © Ryekee。词库来自 [iDvel/rime-ice](https://github.com/iDvel/rime-ice)，请遵循上游许可。

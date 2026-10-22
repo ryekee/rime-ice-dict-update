@@ -60,12 +60,12 @@ def test_3way_upstream_addition_included():
     assert "new\tnew\t2" in out
 
 
-def test_first_run_no_baseline_preserves_all_local_diffs():
+def test_first_run_no_baseline_stops_instead_of_freezing_old_weights():
+    import pytest
     up = [Entry("a", "a", "9")]
     local = [Entry("a", "a", "5"), Entry("mine", "mine", "1")]
-    out = rimeup.merge_incremental(HEADER, up, local, None)
-    assert "a\ta\t5" in out          # local weight preserved (conservative)
-    assert "mine\tmine\t1" in out    # local-only kept
+    with pytest.raises(rimeup.MissingBaselineError):
+        rimeup.merge_incremental(HEADER, up, local, None)
 
 
 # C1: incremental merge with CRLF local content must not spuriously duplicate entries

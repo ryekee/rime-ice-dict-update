@@ -11,7 +11,8 @@ def test_render_entry_no_weight_code_differs():
 
 
 def test_render_entry_single_column_when_code_equals_text():
-    assert rimeup.render_entry(Entry("README.md", "README.md", None)) == "README.md"
+    assert rimeup.render_entry(Entry("README.md", None, None)) == "README.md"
+    assert rimeup.render_entry(Entry("README.md", "README.md", None)) == "README.md\tREADME.md"
 
 
 SAMPLE = """# comment header
@@ -45,7 +46,7 @@ def test_parse_fields():
     pd = rimeup.parse_dict(SAMPLE)
     assert pd.entries[0] == rimeup.Entry("苹果", "ping guo", "100")
     assert pd.entries[1] == rimeup.Entry("香蕉", "xiang jiao", None)
-    assert pd.entries[2] == rimeup.Entry("README.md", "README.md", None)
+    assert pd.entries[2] == rimeup.Entry("README.md", None, None)
 
 
 def test_parse_header_preserved_through_terminator():
@@ -87,13 +88,10 @@ sort: by_weight
 """
 
 
-def test_parse_ellipsis_in_body_skipped():
-    """A '...' line inside the entry body must be silently skipped."""
-    pd = rimeup.parse_dict(SAMPLE_WITH_BODY_ELLIPSIS)
-    texts = [e.text for e in pd.entries]
-    assert "..." not in texts
-    assert "苹果" in texts
-    assert "香蕉" in texts
+def test_parse_rejects_document_markers_in_body():
+    import pytest
+    with pytest.raises(rimeup.ParseError):
+        rimeup.parse_dict(SAMPLE_WITH_BODY_ELLIPSIS)
 
 
 # M6: inline comment leaks into metadata value

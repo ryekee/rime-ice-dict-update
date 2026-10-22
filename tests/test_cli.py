@@ -43,6 +43,7 @@ def test_cli_incremental_merges_and_writes_baseline(tmp_path, writer):
     repo = _fake_repo(tmp_path, writer)
     rime = tmp_path / "rime"
     writer(str(rime / "cn_dicts/a.dict.yaml"), HDR.format(v="1") + "a\ta\t1\nmine\tmine\t5\n")
+    writer(str(tmp_path / "baseline/cn_dicts/a.dict.yaml"), HDR.format(v="1") + "a\ta\t1\n")
     rc = rimeup.main(["--rime-dir", str(rime), "--repo", repo, "--incremental"] + _common(tmp_path))
     assert rc == 0
     out = rimeup._read(str(rime / "cn_dicts/a.dict.yaml"))
@@ -64,17 +65,18 @@ def test_cli_overwrite(tmp_path, writer):
     assert "new\tnew\t2" in out
 
 
-def test_cli_incremental_first_run_prints_reminder(tmp_path, writer, capsys):
-    """Incremental with no baseline should print the first-run reminder."""
+def test_cli_incremental_first_run_stops(tmp_path, writer, capsys):
+    """A missing baseline is an error, not a guess about user edits."""
     repo = _fake_repo(tmp_path, writer)
     rime = tmp_path / "rime"
     writer(str(rime / "cn_dicts/a.dict.yaml"), HDR.format(v="1") + "a\ta\t1\nmine\tmine\t5\n")
     # baseline dir exists but has no file for this rel -> first run
     (tmp_path / "baseline").mkdir(parents=True, exist_ok=True)
     rc = rimeup.main(["--rime-dir", str(rime), "--repo", repo, "--incremental"] + _common(tmp_path))
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "首次增量无基线" in out
+    assert rc != 0
+    assert "缺少基线" in capsys.readouterr().err
+    assert not (tmp_path / "backup").exists()
+    assert not list((tmp_path / "baseline").iterdir())
 
 
 def test_cli_incremental_second_run_no_reminder(tmp_path, writer, capsys):
@@ -82,13 +84,15 @@ def test_cli_incremental_second_run_no_reminder(tmp_path, writer, capsys):
     repo = _fake_repo(tmp_path, writer)
     rime = tmp_path / "rime"
     writer(str(rime / "cn_dicts/a.dict.yaml"), HDR.format(v="1") + "a\ta\t1\nmine\tmine\t5\n")
-    # First run seeds the baseline
-    rimeup.main(["--rime-dir", str(rime), "--repo", repo, "--incremental"] + _common(tmp_path))
+    # Explicit overwrite establishes a known baseline.
+    rimeup.main(["--rime-dir", str(rime), "--repo", repo, "--overwrite"] + _common(tmp_path))
     capsys.readouterr()  # discard first-run output
     # Simulate a local change to trigger updated status on second run
     # We need to make local differ from upstream again; just re-write local with different content
     writer(str(rime / "cn_dicts/a.dict.yaml"), HDR.format(v="1") + "a\ta\t1\nmine\tmine\t99\n")
-    rc = rimeup.main(["--rime-dir", str(rime), "--repo", repo, "--incremental"] + _common(tmp_path))
+    options = _common(tmp_path)
+    options[-1] = str(tmp_path / "second-backup")
+    rc = rimeup.main(["--rime-dir", str(rime), "--repo", repo, "--incremental"] + options)
     assert rc == 0
     out = capsys.readouterr().out
     assert "首次增量无基线" not in out
